@@ -444,6 +444,41 @@ func TestAccCloudFrontMultiTenantDistribution_lambdaFunctionAssociationSwapBlock
 	})
 }
 
+func TestAccCloudFrontMultiTenantDistribution_vpcOriginConfigOwnerAccountID(t *testing.T) {
+	ctx := acctest.Context(t)
+	var distribution awstypes.Distribution
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	resourceName := "aws_cloudfront_multitenant_distribution.test"
+
+	acctest.Test(ctx, t, resource.TestCase{
+		PreCheck:                 func() { acctest.PreCheck(ctx, t); acctest.PreCheckPartitionHasService(t, names.CloudFrontEndpointID) },
+		ErrorCheck:               acctest.ErrorCheck(t, names.CloudFrontServiceID),
+		ProtoV5ProviderFactories: acctest.ProtoV5ProviderFactories,
+		CheckDestroy:             testAccCheckMultiTenantDistributionDestroy(ctx, t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccMultiTenantDistributionConfig_vpcOriginConfigOwnerAccountID(rName),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckMultiTenantDistributionExists(ctx, t, resourceName, &distribution),
+					resource.TestCheckResourceAttr(resourceName, "origin.#", "1"),
+					resource.TestCheckTypeSetElemNestedAttrs(resourceName, "origin.*", map[string]string{
+						"vpc_origin_config.#":                          "1",
+						"vpc_origin_config.0.origin_keepalive_timeout": "5",
+						"vpc_origin_config.0.origin_read_timeout":      "30",
+					}),
+					resource.TestCheckResourceAttrSet(resourceName, "origin.0.vpc_origin_config.0.owner_account_id"),
+				),
+			},
+			{
+				ResourceName:            resourceName,
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"etag"},
+			},
+		},
+	})
+}
+
 func testAccCheckMultiTenantDistributionDestroy(ctx context.Context, t *testing.T) resource.TestCheckFunc {
 	return func(s *terraform.State) error {
 		conn := acctest.ProviderMeta(ctx, t).CloudFrontClient(ctx)
@@ -1197,4 +1232,83 @@ resource "aws_cloudfront_multitenant_distribution" "test" {
   }
 }
 `, rName, lambdaFunctionAssociationBlocks)
+}
+
+func testAccMultiTenantDistributionConfig_vpcOriginConfigOwnerAccountID(rName string) string {
+	return acctest.ConfigCompose(testAccVPCOriginConfig_basic(rName), fmt.Sprintf(`
+data "aws_caller_identity" "current" {}
+
+resource "aws_cloudfront_multitenant_distribution" "test" {
+  enabled = false
+  comment = "test multi-tenant distribution with cross-account VPC origin"
+
+  origin {
+    domain_name = "www.example.com"
+    id          = "test"
+
+    vpc_origin_config {
+      vpc_origin_id    = aws_cloudfront_vpc_origin.test.id
+      owner_account_id = data.aws_caller_identity.current.account_id
+    }
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "test"
+    viewer_protocol_policy = "allow-all"
+    cache_policy_id        = aws_cloudfront_cache_policy.test.id
+
+    allowed_methods {
+      items = ["GET", "HEAD"]
+    }
+    
+    cached_methods {
+      items = ["GET", "HEAD"]
+    }
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  tenant_config {
+    parameter_definition {
+      name = "test_param"
+      
+      definition {
+        string_schema {
+          required = true
+          comment  = "Test parameter"
+        }
+      }
+    }
+  }
+}
+
+resource "aws_cloudfront_cache_policy" "test" {
+  name        = %[1]q
+  min_ttl     = 0
+  default_ttl = 0
+  max_ttl     = 0
+
+  parameters_in_cache_key_and_forwarded_to_origin {
+    cookies_config {
+      cookie_behavior = "none"
+    }
+    
+    headers_config {
+      header_behavior = "none"
+    }
+    
+    query_strings_config {
+      query_string_behavior = "none"
+    }
+  }
+}
+`, rName))
 }
