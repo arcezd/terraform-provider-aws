@@ -121,6 +121,41 @@ func TestAccCloudFrontMultiTenantDistribution_basic(t *testing.T) {
 	})
 }
 
+func TestAccCloudFrontMultiTenantDistribution_vpcOriginConfigOwnerAccountID(t *testing.T) {
+	ctx := acctest.Context(t)
+	var distribution awstypes.Distribution
+	rName := acctest.RandomWithPrefix(t, acctest.ResourcePrefix)
+	resourceName := "aws_cloudfront_multitenant_distribution.test"
+
+	acctest.ParallelTest(ctx, t, resource.TestCase{
+		PreCheck: func() {
+			acctest.PreCheck(ctx, t)
+			acctest.PreCheckPartitionHasService(t, names.CloudFrontEndpointID)
+			acctest.PreCheckAlternateAccount(t)
+		},
+		ErrorCheck:               acctest.ErrorCheck(t, names.CloudFrontServiceID),
+		ProtoV5ProviderFactories: acctest.ProtoV5FactoriesAlternate(ctx, t),
+		CheckDestroy:             testAccCheckMultiTenantDistributionDestroy(ctx, t),
+		Steps: []resource.TestStep{
+			{
+				Config: testAccMultiTenantDistributionConfig_vpcOriginConfigOwnerAccountID(rName),
+				Check: resource.ComposeTestCheckFunc(
+					testAccCheckMultiTenantDistributionExists(ctx, t, resourceName, &distribution),
+					resource.TestCheckResourceAttr(resourceName, "origin.#", "1"),
+					resource.TestCheckResourceAttr(resourceName, "origin.0.vpc_origin_config.#", "1"),
+					resource.TestCheckResourceAttrPair(resourceName, "origin.0.vpc_origin_config.0.owner_account_id", "data.aws_caller_identity.owner", names.AttrAccountID),
+				),
+			},
+			{
+				ResourceName:            resourceName,
+				ImportState:             true,
+				ImportStateVerify:       true,
+				ImportStateVerifyIgnore: []string{"etag"},
+			},
+		},
+	})
+}
+
 func TestAccCloudFrontMultiTenantDistribution_disappears(t *testing.T) {
 	ctx := acctest.Context(t)
 	var distribution awstypes.Distribution
@@ -1006,6 +1041,204 @@ resource "aws_cloudfront_multitenant_distribution" "test" {
   }
 }
 `
+}
+
+// The VPC origin is owned by the alternate account and shared with the test account through AWS RAM.
+// CloudFront omits OwnerAccountId for a same-account VPC origin, so owner_account_id is only testable cross-account.
+func testAccMultiTenantDistributionConfig_vpcOriginConfigOwnerAccountID(rName string) string {
+	return acctest.ConfigCompose(acctest.ConfigAlternateAccountProvider(), fmt.Sprintf(`
+data "aws_caller_identity" "current" {}
+
+data "aws_caller_identity" "owner" {
+  provider = "awsalternate"
+}
+
+data "aws_availability_zones" "available" {
+  provider = "awsalternate"
+
+  exclude_zone_ids = ["usw2-az4", "usgw1-az2"]
+  state            = "available"
+
+  filter {
+    name   = "opt-in-status"
+    values = ["opt-in-not-required"]
+  }
+}
+
+resource "aws_vpc" "test" {
+  provider = "awsalternate"
+
+  cidr_block = "10.0.0.0/16"
+
+  tags = {
+    Name = %[1]q
+  }
+}
+
+resource "aws_subnet" "test" {
+  provider = "awsalternate"
+
+  count = 2
+
+  vpc_id            = aws_vpc.test.id
+  availability_zone = data.aws_availability_zones.available.names[count.index]
+  cidr_block        = cidrsubnet(aws_vpc.test.cidr_block, 8, count.index)
+
+  tags = {
+    Name = %[1]q
+  }
+}
+
+resource "aws_security_group" "test" {
+  provider = "awsalternate"
+
+  name   = %[1]q
+  vpc_id = aws_vpc.test.id
+
+  ingress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  egress {
+    from_port   = 0
+    to_port     = 0
+    protocol    = "-1"
+    cidr_blocks = ["0.0.0.0/0"]
+  }
+
+  tags = {
+    Name = %[1]q
+  }
+}
+
+resource "aws_internet_gateway" "test" {
+  provider = "awsalternate"
+
+  vpc_id = aws_vpc.test.id
+
+  tags = {
+    Name = %[1]q
+  }
+}
+
+resource "aws_lb" "test" {
+  provider = "awsalternate"
+
+  name            = %[1]q
+  security_groups = [aws_security_group.test.id]
+  subnets         = aws_subnet.test[*].id
+
+  idle_timeout               = 30
+  enable_deletion_protection = false
+
+  tags = {
+    Name = %[1]q
+  }
+
+  depends_on = [aws_internet_gateway.test]
+}
+
+resource "aws_cloudfront_vpc_origin" "test" {
+  provider = "awsalternate"
+
+  vpc_origin_endpoint_config {
+    name                   = %[1]q
+    arn                    = aws_lb.test.arn
+    http_port              = 8080
+    https_port             = 8443
+    origin_protocol_policy = "http-only"
+
+    origin_ssl_protocols {
+      items    = ["TLSv1.2"]
+      quantity = 1
+    }
+  }
+}
+
+resource "aws_ram_resource_share" "test" {
+  provider = "awsalternate"
+
+  name                      = %[1]q
+  allow_external_principals = true
+
+  tags = {
+    Name = %[1]q
+  }
+}
+
+resource "aws_ram_resource_association" "test" {
+  provider = "awsalternate"
+
+  resource_arn       = aws_cloudfront_vpc_origin.test.arn
+  resource_share_arn = aws_ram_resource_share.test.arn
+}
+
+resource "aws_ram_principal_association" "test" {
+  provider = "awsalternate"
+
+  principal          = data.aws_caller_identity.current.account_id
+  resource_share_arn = aws_ram_resource_share.test.arn
+}
+
+resource "aws_ram_resource_share_accepter" "test" {
+  share_arn = aws_ram_principal_association.test.resource_share_arn
+
+  depends_on = [aws_ram_resource_association.test]
+}
+
+resource "aws_cloudfront_multitenant_distribution" "test" {
+  enabled = false
+  comment = "Test multi-tenant distribution"
+
+  origin {
+    domain_name = "www.example.com"
+    id          = "example"
+
+    vpc_origin_config {
+      vpc_origin_id    = aws_cloudfront_vpc_origin.test.id
+      owner_account_id = data.aws_caller_identity.owner.account_id
+    }
+  }
+
+  default_cache_behavior {
+    target_origin_id       = "example"
+    viewer_protocol_policy = "redirect-to-https"
+    cache_policy_id        = "4135ea2d-6df8-44a3-9df3-4b5a84be39ad" # AWS Managed CachingDisabled policy
+
+    allowed_methods {
+      items          = ["DELETE", "GET", "HEAD", "OPTIONS", "PATCH", "POST", "PUT"]
+      cached_methods = ["GET", "HEAD", "OPTIONS"]
+    }
+  }
+
+  viewer_certificate {
+    cloudfront_default_certificate = true
+  }
+
+  restrictions {
+    geo_restriction {
+      restriction_type = "none"
+    }
+  }
+
+  tenant_config {
+    parameter_definition {
+      name = "origin_domain"
+      definition {
+        string_schema {
+          required = true
+          comment  = "Origin domain parameter for tenants"
+        }
+      }
+    }
+  }
+
+  depends_on = [aws_ram_resource_share_accepter.test]
+}
+`, rName))
 }
 
 func testAccMultiTenantDistributionConfig_comprehensive(rName, comment, defaultRootObject string, compress bool) string {
